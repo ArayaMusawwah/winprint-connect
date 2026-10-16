@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Windows Printer Finder (WinPrint Connect)
+GenericName=SMB Shared Printer Connector
+Comment=Pindai dan hubungkan printer share Windows 10/11 langsung ke CUPS / KDE dengan satu klik
+Exec=/home/root_iqbal/.local/bin/winprint-connect
+Icon=printer
+Terminal=false
+Type=Application
+Categories=Utility;Settings;HardwareSettings;Printing;Qt;KDE;
+Keywords=printer;smb;samba;windows;cups;share;network;
+StartupNotify=true

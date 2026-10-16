@@ -1,0 +1,956 @@
+#!/usr/bin/env python3
+"""
+WinPrint Connect - Windows Shared Printer Connector for Linux (KDE/CUPS)
+Pixel-perfect, OCD-friendly, WCAG AA compliant SMB printer discovery & setup tool.
+"""
+
+import sys
+import os
+import re
+import json
+import socket
+import ipaddress
+import urllib.parse
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QLineEdit, QPushButton, QScrollArea, QFrame, QComboBox,
+    QCheckBox, QProgressBar, QMessageBox, QSizePolicy, QSpacerItem
+)
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QIcon, QFont, QPalette, QColor, QDesktopServices
+from PySide6.QtCore import QUrl
+
+APP_NAME = "WinPrint Connect"
+CONFIG_DIR = os.path.expanduser("~/.config/winprint-connect")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "history.json")
+DEFAULT_HOST = "192.168.25.5"
+
+DRIVERS = [
+    ("auto", "Deteksi Otomatis (Rekomendasi)"),
+    ("drv:///hp/hpcups.drv/hp-laserjet_professional_p1102.ppd", "HP LaserJet P1102 (hpcups)"),
+    ("drv:///sample.drv/epson9.ppd", "Epson Dot Matrix 9-Pin (LX-310 / LX-300)"),
+    ("drv:///sample.drv/epson24.ppd", "Epson Dot Matrix 24-Pin (LQ Series)"),
+    ("drv:///sample.drv/postscript.ppd", "Generic PostScript Printer"),
+    ("drv:///sample.drv/generic.ppd", "Generic PCL Laser Printer"),
+    ("raw", "Raw Passthrough (Windows Spooler)"),
+]
+
+
+# ============================================================================
+# Helpers & Utilities
+# ============================================================================
+
+def sanitize_cups_name(name: str) -> str:
+    cleaned = re.sub(r'[^a-zA-Z0-9_\-]', '_', name)
+    cleaned = re.sub(r'_+', '_', cleaned).strip('_')
+    return cleaned or "printer"
+
+
+def guess_driver_for_name(text: str) -> str:
+    lower = text.lower()
+    if "p1102" in lower or "laserjet professional" in lower:
+        return "drv:///hp/hpcups.drv/hp-laserjet_professional_p1102.ppd"
+    if any(k in lower for k in ["lx-310", "lx-300", "lx310", "lx300", "epson 9", "9-pin", "dot matrix"]):
+        return "drv:///sample.drv/epson9.ppd"
+    if any(k in lower for k in ["lq-310", "lq-2190", "lq310", "24-pin"]):
+        return "drv:///sample.drv/epson24.ppd"
+    if "postscript" in lower or "ps" in lower:
+        return "drv:///sample.drv/postscript.ppd"
+    if "laserjet" in lower or "pcl" in lower:
+        return "drv:///sample.drv/generic.ppd"
+    return "drv:///sample.drv/generic.ppd"
+
+
+def get_installed_cups_printers() -> dict:
+    installed = {}
+    try:
+        res = subprocess.run(["lpstat", "-v"], capture_output=True, text=True, timeout=5)
+        for line in res.stdout.splitlines():
+            m = re.match(r"^device for (.*?):\s+(.*)$", line)
+            if m:
+                pname = m.group(1).strip()
+                uri = m.group(2).strip()
+                installed[pname] = uri
+    except Exception:
+        pass
+    return installed
+
+
+def get_default_cups_printer() -> str:
+    try:
+        res = subprocess.run(["lpstat", "-d"], capture_output=True, text=True, timeout=5)
+        m = re.search(r"destination:\s*(\S+)", res.stdout)
+        if m:
+            return m.group(1).strip()
+    except Exception:
+        pass
+    return ""
+
+
+# ============================================================================
+# Configuration Management
+# ============================================================================
+
+class ConfigManager:
+    @staticmethod
+    def load() -> dict:
+        default_cfg = {
+            "recent_hosts": [DEFAULT_HOST, "pc1"],
+            "last_host": DEFAULT_HOST,
+            "auth": {
+                "remember": False,
+                "username": "jasanet"
+            }
+        }
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    default_cfg.update(data)
+            except Exception:
+                pass
+        return default_cfg
+
+    @staticmethod
+    def save(cfg: dict):
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
+
+
+# ============================================================================
+# Background Threads (Workers)
+# ============================================================================
+
+class SubnetScanWorker(QThread):
+    finished = Signal(list)
+    status = Signal(str)
+
+    def run(self):
+        self.status.emit("Mendeteksi antarmuka jaringan lokal...")
+        local_ip = "127.0.0.1"
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("192.168.25.1", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            local_ip = "192.168.25.10"
+
+        net = ipaddress.IPv4Network(f"{local_ip}/24", strict=False)
+        self.status.emit(f"Memindai host SMB di subnet {net.network_address}/24...")
+
+        def check_host(ip_str):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.20)
+            try:
+                if sock.connect_ex((ip_str, 445)) == 0:
+                    return ip_str
+            except Exception:
+                pass
+            finally:
+                sock.close()
+            return None
+
+        hosts_to_scan = [str(h) for h in net.hosts()]
+        found = []
+        with ThreadPoolExecutor(max_workers=50) as pool:
+            for ip in pool.map(check_host, hosts_to_scan):
+                if ip:
+                    found.append(ip)
+
+        self.finished.emit(found)
+
+
+class SmbScanWorker(QThread):
+    finished = Signal(list, str)
+    error = Signal(str)
+
+    def __init__(self, host, username="", password=""):
+        super().__init__()
+        self.host = host.strip()
+        self.username = username.strip()
+        self.password = password.strip()
+
+    def run(self):
+        if not self.host:
+            self.error.emit("Silakan masukkan Hostname atau IP Windows.")
+            return
+
+        cmd = ["smbclient", "-L", f"//{self.host}"]
+        if self.username:
+            auth = f"{self.username}%{self.password}"
+            cmd.extend(["-U", auth])
+        else:
+            cmd.append("-N")
+
+        env = os.environ.copy()
+        env["SMB_CONF_PATH"] = "/dev/null"
+
+        try:
+            res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=10)
+            output = res.stdout
+            err = res.stderr
+
+            if "NT_STATUS_LOGON_FAILURE" in err or "LOGON_FAILURE" in output:
+                self.error.emit("Gagal login ke Windows: Username atau password salah.")
+                return
+
+            if "NT_STATUS_ACCESS_DENIED" in err and not self.username:
+                self.error.emit("Akses ditolak: Windows memerlukan akun/password untuk melihat printer.")
+                return
+
+            printers = []
+            for line in output.splitlines():
+                m = re.match(r"^\t(?!.*?\bDisk\b)(.*?)\s+Printer\s*(.*)$", line)
+                if m:
+                    sharename = m.group(1).strip()
+                    comment = m.group(2).strip()
+                    printers.append({
+                        "sharename": sharename,
+                        "comment": comment,
+                        "host": self.host
+                    })
+
+            self.finished.emit(printers, self.host)
+        except subprocess.TimeoutExpired:
+            self.error.emit(f"Koneksi timeout ke {self.host}. Pastikan PC Windows menyala dan port SMB terbuka.")
+        except Exception as e:
+            self.error.emit(f"Error memindai: {str(e)}")
+
+
+# ============================================================================
+# UI Component: PrinterCard
+# ============================================================================
+
+class PrinterCard(QFrame):
+    status_changed = Signal()
+
+    def __init__(self, printer_info, auth_info, parent=None):
+        super().__init__(parent)
+        self.printer_info = printer_info
+        self.auth_info = auth_info
+        self.sharename = printer_info["sharename"]
+        self.comment = printer_info["comment"] or "Shared Windows Printer"
+        self.host = printer_info["host"]
+        self.cups_name = sanitize_cups_name(self.sharename)
+        self.init_ui()
+
+    def init_ui(self):
+        self.setObjectName("PrinterCard")
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(16)
+
+        # 1. Left: Printer Icon in styled container (44x44)
+        icon_box = QFrame(self)
+        icon_box.setObjectName("IconBox")
+        icon_box.setFixedSize(48, 48)
+        icon_box_layout = QVBoxLayout(icon_box)
+        icon_box_layout.setContentsMargins(0, 0, 0, 0)
+        icon_box_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        icon_lbl = QLabel(icon_box)
+        icon = QIcon.fromTheme("printer", QIcon.fromTheme("printer-symbolic"))
+        icon_lbl.setPixmap(icon.pixmap(32, 32))
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_box_layout.addWidget(icon_lbl)
+        layout.addWidget(icon_box)
+
+        # 2. Center: Metadata & Driver Selection
+        info_layout = QVBoxLayout()
+        info_layout.setSpacing(6)
+
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
+
+        self.name_lbl = QLabel(self.sharename, self)
+        font_title = QFont()
+        font_title.setPointSize(11)
+        font_title.setBold(True)
+        self.name_lbl.setFont(font_title)
+        self.name_lbl.setToolTip(f"Nama share Windows: {self.sharename}")
+        title_row.addWidget(self.name_lbl)
+
+        # Badges
+        self.badge_lbl = QLabel(self)
+        self.badge_lbl.setFont(QFont("", 9, QFont.Weight.Bold))
+        self.badge_lbl.setVisible(False)
+        title_row.addWidget(self.badge_lbl)
+
+        self.default_badge_lbl = QLabel(self)
+        self.default_badge_lbl.setText("  ★ DEFAULT  ")
+        self.default_badge_lbl.setStyleSheet("""
+            background-color: #f39c12;
+            color: #ffffff;
+            border-radius: 4px;
+            padding: 2px 6px;
+            font-weight: bold;
+            font-size: 10px;
+        """)
+        self.default_badge_lbl.setVisible(False)
+        title_row.addWidget(self.default_badge_lbl)
+
+        title_row.addStretch()
+        info_layout.addLayout(title_row)
+
+        # Meta Line
+        self.desc_lbl = QLabel(f"Host: {self.host}  •  {self.comment}", self)
+        self.desc_lbl.setObjectName("SubText")
+        info_layout.addWidget(self.desc_lbl)
+
+        # Driver row
+        drv_row = QHBoxLayout()
+        drv_row.setSpacing(8)
+        drv_tag = QLabel("Driver:", self)
+        drv_tag.setObjectName("SubText")
+        self.drv_combo = QComboBox(self)
+        self.drv_combo.setToolTip("Pilih driver pencocokan untuk printer ini")
+        for val, label in DRIVERS:
+            self.drv_combo.addItem(label, val)
+
+        guessed = guess_driver_for_name(self.sharename + " " + self.comment)
+        idx = self.drv_combo.findData(guessed)
+        if idx >= 0:
+            self.drv_combo.setCurrentIndex(idx)
+
+        drv_row.addWidget(drv_tag)
+        drv_row.addWidget(self.drv_combo)
+        drv_row.addStretch()
+        info_layout.addLayout(drv_row)
+
+        layout.addLayout(info_layout, stretch=1)
+
+        # 3. Right: Action Buttons
+        self.btn_layout = QHBoxLayout()
+        self.btn_layout.setSpacing(8)
+
+        # Connect button
+        self.btn_connect = QPushButton("Hubungkan", self)
+        self.btn_connect.setIcon(QIcon.fromTheme("list-add", QIcon.fromTheme("dialog-ok")))
+        self.btn_connect.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_connect.setToolTip("Daftarkan printer ini ke antrean CUPS Linux")
+        self.btn_connect.clicked.connect(self.connect_printer)
+        self.btn_layout.addWidget(self.btn_connect)
+
+        # Test page button
+        self.btn_test = QPushButton("Cetak Tes", self)
+        self.btn_test.setIcon(QIcon.fromTheme("document-print"))
+        self.btn_test.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_test.setToolTip("Kirim halaman uji coba cetak ke printer ini")
+        self.btn_test.clicked.connect(self.print_test_page)
+        self.btn_test.setVisible(False)
+        self.btn_layout.addWidget(self.btn_test)
+
+        # Make default button
+        self.btn_default = QPushButton("Default", self)
+        self.btn_default.setIcon(QIcon.fromTheme("emblem-default"))
+        self.btn_default.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_default.setToolTip("Jadikan printer ini sebagai printer bawaan sistem")
+        self.btn_default.clicked.connect(self.set_as_default)
+        self.btn_default.setVisible(False)
+        self.btn_layout.addWidget(self.btn_default)
+
+        # Remove button
+        self.btn_remove = QPushButton("Hapus", self)
+        self.btn_remove.setIcon(QIcon.fromTheme("edit-delete"))
+        self.btn_remove.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_remove.setObjectName("DangerButton")
+        self.btn_remove.setToolTip("Hapus printer ini dari CUPS")
+        self.btn_remove.clicked.connect(self.remove_printer)
+        self.btn_remove.setVisible(False)
+        self.btn_layout.addWidget(self.btn_remove)
+
+        layout.addLayout(self.btn_layout)
+        self.update_status()
+
+    def update_status(self):
+        installed = get_installed_cups_printers()
+        default_printer = get_default_cups_printer()
+        quoted = urllib.parse.quote(self.sharename).lower()
+        raw = self.sharename.lower()
+
+        matched_cups_name = None
+        if self.cups_name in installed:
+            matched_cups_name = self.cups_name
+        else:
+            for cname, uri in installed.items():
+                uri_l = uri.lower()
+                if (quoted in uri_l or raw in uri_l) and self.host in uri_l:
+                    matched_cups_name = cname
+                    break
+
+        if matched_cups_name:
+            self.cups_name = matched_cups_name
+            self.badge_lbl.setText("  ✓ TERHUBUNG  ")
+            self.badge_lbl.setStyleSheet("""
+                background-color: #27ae60;
+                color: #ffffff;
+                border-radius: 4px;
+                padding: 2px 8px;
+                font-weight: bold;
+                font-size: 10px;
+            """)
+            self.badge_lbl.setVisible(True)
+
+            is_default = (self.cups_name == default_printer)
+            self.default_badge_lbl.setVisible(is_default)
+            self.btn_default.setEnabled(not is_default)
+
+            self.desc_lbl.setText(f"Antrean CUPS: {self.cups_name}  •  Host: {self.host}  •  {self.comment}")
+            self.btn_connect.setVisible(False)
+            self.btn_test.setVisible(True)
+            self.btn_default.setVisible(True)
+            self.btn_remove.setVisible(True)
+            self.drv_combo.setEnabled(False)
+        else:
+            self.badge_lbl.setVisible(False)
+            self.default_badge_lbl.setVisible(False)
+            self.desc_lbl.setText(f"Host: {self.host}  •  {self.comment}")
+            self.btn_connect.setVisible(True)
+            self.btn_connect.setText("Hubungkan")
+            self.btn_connect.setObjectName("PrimaryButton")
+            self.btn_test.setVisible(False)
+            self.btn_default.setVisible(False)
+            self.btn_remove.setVisible(False)
+            self.drv_combo.setEnabled(True)
+
+    def connect_printer(self):
+        driver = self.drv_combo.currentData()
+        if driver == "auto":
+            driver = guess_driver_for_name(self.sharename + " " + self.comment)
+
+        quoted_share = urllib.parse.quote(self.sharename)
+        username = self.auth_info.get("username", "").strip()
+        password = self.auth_info.get("password", "").strip()
+
+        if username and password:
+            uri = f"smb://{username}:{password}@{self.host}/{quoted_share}"
+        elif username:
+            uri = f"smb://{username}@{self.host}/{quoted_share}"
+        else:
+            uri = f"smb://{self.host}/{quoted_share}"
+
+        cmd = [
+            "lpadmin",
+            "-p", self.cups_name,
+            "-E",
+            "-v", uri,
+            "-D", f"{self.sharename} di {self.host}",
+            "-L", f"Windows PC ({self.host})",
+        ]
+
+        if driver == "raw":
+            cmd.extend(["-m", "raw"])
+        else:
+            cmd.extend(["-m", driver])
+
+        if not (username and password):
+            cmd.extend(["-o", "auth-info-required=username,password"])
+
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            subprocess.run(["cupsenable", self.cups_name], check=False)
+            subprocess.run(["cupsaccept", self.cups_name], check=False)
+            self.update_status()
+            self.status_changed.emit()
+            QMessageBox.information(self, "Berhasil", f"Printer '{self.sharename}' berhasil ditambahkan ke CUPS!")
+        except subprocess.CalledProcessError as e:
+            QMessageBox.critical(self, "Gagal Menambahkan", f"Error saat menjalankan lpadmin:\n{e.stderr or e.stdout}")
+
+    def print_test_page(self):
+        try:
+            testfile = "/usr/share/cups/data/testprint"
+            if os.path.exists(testfile):
+                subprocess.run(["lp", "-d", self.cups_name, testfile], check=True)
+            else:
+                proc = subprocess.Popen(["lp", "-d", self.cups_name], stdin=subprocess.PIPE, text=True)
+                proc.communicate(input=f"Test Print from WinPrint Connect\nPrinter: {self.sharename}\nHost: {self.host}\n")
+            QMessageBox.information(self, "Cetak Terkirim", f"Halaman tes berhasil dikirim ke antrean '{self.cups_name}'.")
+        except Exception as e:
+            QMessageBox.warning(self, "Gagal Cetak", f"Tidak dapat mengirim tes cetak: {str(e)}")
+
+    def set_as_default(self):
+        try:
+            subprocess.run(["lpadmin", "-d", self.cups_name], check=True)
+            self.update_status()
+            self.status_changed.emit()
+            QMessageBox.information(self, "Default Printer", f"'{self.cups_name}' sekarang menjadi printer utama (default).")
+        except Exception as e:
+            QMessageBox.warning(self, "Gagal", str(e))
+
+    def remove_printer(self):
+        reply = QMessageBox.question(
+            self, "Konfirmasi Hapus",
+            f"Yakin ingin menghapus printer '{self.cups_name}' dari sistem Linux?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            subprocess.run(["lpadmin", "-x", self.cups_name], check=False)
+            self.update_status()
+            self.status_changed.emit()
+
+
+# ============================================================================
+# Main Window
+# ============================================================================
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_NAME)
+        self.resize(780, 600)
+        self.setMinimumSize(680, 500)
+        self.setWindowIcon(QIcon.fromTheme("printer", QIcon.fromTheme("network-wired")))
+        self.cfg = ConfigManager.load()
+        self.init_ui()
+
+    def init_ui(self):
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(24, 24, 24, 24)
+        main_layout.setSpacing(16)
+
+        # 1. Header Box (Icon + Titles + Live Host Counter)
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(16)
+
+        header_icon_box = QFrame(self)
+        header_icon_box.setObjectName("HeaderIconBox")
+        header_icon_box.setFixedSize(56, 56)
+        hib_layout = QVBoxLayout(header_icon_box)
+        hib_layout.setContentsMargins(0, 0, 0, 0)
+        hib_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        icon_lbl = QLabel(header_icon_box)
+        icon_lbl.setPixmap(QIcon.fromTheme("printer").pixmap(40, 40))
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hib_layout.addWidget(icon_lbl)
+        header_layout.addWidget(header_icon_box)
+
+        head_text_layout = QVBoxLayout()
+        head_text_layout.setSpacing(3)
+
+        title = QLabel(APP_NAME, self)
+        font_title = QFont()
+        font_title.setPointSize(14)
+        font_title.setBold(True)
+        title.setFont(font_title)
+        head_text_layout.addWidget(title)
+
+        subtitle = QLabel("Pindai dan hubungkan printer share Windows 10/11 langsung ke antrean CUPS KDE.", self)
+        subtitle.setObjectName("SubText")
+        head_text_layout.addWidget(subtitle)
+
+        header_layout.addLayout(head_text_layout)
+        header_layout.addStretch()
+
+        # Web CUPS quick link button
+        btn_cups_web = QPushButton("Web CUPS", self)
+        btn_cups_web.setIcon(QIcon.fromTheme("applications-internet"))
+        btn_cups_web.setToolTip("Buka halaman antarmuka web CUPS di browser")
+        btn_cups_web.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_cups_web.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("http://localhost:631/printers/")))
+        header_layout.addWidget(btn_cups_web)
+
+        main_layout.addLayout(header_layout)
+
+        # 2. Search & Discovery Group Frame
+        search_frame = QFrame(self)
+        search_frame.setObjectName("SearchFrame")
+        search_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        sf_layout = QVBoxLayout(search_frame)
+        sf_layout.setContentsMargins(18, 18, 18, 18)
+        sf_layout.setSpacing(12)
+
+        host_row = QHBoxLayout()
+        host_row.setSpacing(10)
+
+        host_lbl = QLabel("Host / IP Windows:", self)
+        font_lbl = QFont()
+        font_lbl.setBold(True)
+        host_lbl.setFont(font_lbl)
+
+        # Editable ComboBox for Host History
+        self.host_combo = QComboBox(self)
+        self.host_combo.setEditable(True)
+        self.host_combo.setInsertPolicy(QComboBox.InsertPolicy.InsertAtTop)
+        self.host_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.host_combo.setToolTip("Pilih dari riwayat atau ketik IP/hostname Windows")
+
+        # Populate history
+        recent = self.cfg.get("recent_hosts", [DEFAULT_HOST])
+        for h in recent:
+            self.host_combo.addItem(h)
+        last_host = self.cfg.get("last_host", DEFAULT_HOST)
+        self.host_combo.setCurrentText(last_host)
+        self.host_combo.lineEdit().returnPressed.connect(self.start_scan)
+
+        # Scan Printer button (Primary)
+        self.btn_scan = QPushButton("  Cari Printer", self)
+        self.btn_scan.setIcon(QIcon.fromTheme("edit-find", QIcon.fromTheme("system-search")))
+        self.btn_scan.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_scan.setObjectName("PrimaryButton")
+        self.btn_scan.setToolTip("Cari printer yang dibagikan pada host ini")
+        self.btn_scan.clicked.connect(self.start_scan)
+
+        # Auto-Discover LAN button (Secondary)
+        self.btn_discover = QPushButton("  Scan LAN", self)
+        self.btn_discover.setIcon(QIcon.fromTheme("network-workgroup", QIcon.fromTheme("network-wired")))
+        self.btn_discover.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_discover.setToolTip("Pindai otomatis PC Windows aktif di subnet lokal")
+        self.btn_discover.clicked.connect(self.start_subnet_scan)
+
+        host_row.addWidget(host_lbl)
+        host_row.addWidget(self.host_combo, stretch=1)
+        host_row.addWidget(self.btn_scan)
+        host_row.addWidget(self.btn_discover)
+        sf_layout.addLayout(host_row)
+
+        # Optional Auth Row
+        self.chk_auth = QCheckBox("Gunakan Akun Windows (Bila Printer Memerlukan Username & Password)", self)
+        self.chk_auth.setToolTip("Aktifkan jika PC Windows tidak mengizinkan guest/anonymous access")
+        self.chk_auth.setChecked(self.cfg.get("auth", {}).get("remember", False))
+        self.chk_auth.toggled.connect(self.toggle_auth_fields)
+        sf_layout.addWidget(self.chk_auth)
+
+        self.auth_widget = QWidget(self)
+        auth_row = QHBoxLayout(self.auth_widget)
+        auth_row.setContentsMargins(0, 4, 0, 0)
+        auth_row.setSpacing(12)
+
+        u_lbl = QLabel("User:", self)
+        self.user_input = QLineEdit(self.cfg.get("auth", {}).get("username", "jasanet"), self)
+        self.user_input.setPlaceholderText("Username Windows")
+
+        p_lbl = QLabel("Password:", self)
+        self.pass_input = QLineEdit(self)
+        self.pass_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.pass_input.setPlaceholderText("Password")
+
+        auth_row.addWidget(u_lbl)
+        auth_row.addWidget(self.user_input, stretch=1)
+        auth_row.addWidget(p_lbl)
+        auth_row.addWidget(self.pass_input, stretch=1)
+
+        self.auth_widget.setVisible(self.chk_auth.isChecked())
+        sf_layout.addWidget(self.auth_widget)
+
+        main_layout.addWidget(search_frame)
+
+        # 3. Status Bar & Animated Progress Indicator
+        status_box = QHBoxLayout()
+        status_box.setSpacing(8)
+
+        self.status_lbl = QLabel("Pilih IP/hostname Windows lalu klik 'Cari Printer' atau gunakan 'Scan LAN'.", self)
+        self.status_lbl.setObjectName("SubText")
+        status_box.addWidget(self.status_lbl)
+        status_box.addStretch()
+
+        self.rescan_btn = QPushButton("Refresh Status", self)
+        self.rescan_btn.setIcon(QIcon.fromTheme("view-refresh"))
+        self.rescan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.rescan_btn.setToolTip("Perbarui status terhubung dari CUPS")
+        self.rescan_btn.clicked.connect(self.refresh_cards_status)
+        self.rescan_btn.setVisible(False)
+        status_box.addWidget(self.rescan_btn)
+
+        main_layout.addLayout(status_box)
+
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setFixedHeight(4)
+        self.progress_bar.setTextVisible(False)
+        main_layout.addWidget(self.progress_bar)
+
+        # 4. Result Area (Scroll Area for Printer Cards)
+        self.scroll_area = QScrollArea(self)
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+
+        self.scroll_content = QWidget()
+        self.scroll_layout = QVBoxLayout(self.scroll_content)
+        self.scroll_layout.setContentsMargins(0, 0, 0, 0)
+        self.scroll_layout.setSpacing(12)
+
+        # Initial Empty State Placeholder
+        self.empty_state = QFrame(self.scroll_content)
+        self.empty_state.setObjectName("EmptyStateFrame")
+        es_layout = QVBoxLayout(self.empty_state)
+        es_layout.setContentsMargins(24, 48, 24, 48)
+        es_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        es_layout.setSpacing(12)
+
+        es_icon = QLabel(self.empty_state)
+        es_icon.setPixmap(QIcon.fromTheme("network-workgroup").pixmap(48, 48))
+        es_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        es_layout.addWidget(es_icon)
+
+        es_text = QLabel("Belum ada printer yang dimuat.\nKlik 'Cari Printer' untuk melihat daftar printer share di PC target.", self.empty_state)
+        es_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        es_text.setObjectName("SubText")
+        es_layout.addWidget(es_text)
+
+        self.scroll_layout.addWidget(self.empty_state)
+        self.scroll_layout.addStretch()
+
+        self.scroll_area.setWidget(self.scroll_content)
+        main_layout.addWidget(self.scroll_area, stretch=1)
+
+        # 5. Footer Buttons
+        footer_layout = QHBoxLayout()
+        footer_layout.setSpacing(12)
+
+        btn_kde = QPushButton("Buka Pengaturan Printer KDE", self)
+        btn_kde.setIcon(QIcon.fromTheme("configure", QIcon.fromTheme("preferences-system")))
+        btn_kde.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_kde.setToolTip("Buka kontrol panel printer KDE System Settings")
+        btn_kde.clicked.connect(self.open_kde_settings)
+        footer_layout.addWidget(btn_kde)
+
+        footer_layout.addStretch()
+
+        btn_close = QPushButton("Tutup", self)
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.clicked.connect(self.close)
+        footer_layout.addWidget(btn_close)
+
+        main_layout.addLayout(footer_layout)
+
+    def toggle_auth_fields(self, checked):
+        self.auth_widget.setVisible(checked)
+
+    def save_host_to_history(self, host):
+        recent = self.cfg.get("recent_hosts", [])
+        if host in recent:
+            recent.remove(host)
+        recent.insert(0, host)
+        self.cfg["recent_hosts"] = recent[:8]
+        self.cfg["last_host"] = host
+        self.cfg["auth"] = {
+            "remember": self.chk_auth.isChecked(),
+            "username": self.user_input.text().strip()
+        }
+        ConfigManager.save(self.cfg)
+
+    def start_subnet_scan(self):
+        self.btn_discover.setEnabled(False)
+        self.btn_scan.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.status_lbl.setText("Memindai subnet lokal untuk menemukan PC Windows aktif...")
+
+        self.subnet_worker = SubnetScanWorker()
+        self.subnet_worker.status.connect(lambda msg: self.status_lbl.setText(msg))
+        self.subnet_worker.finished.connect(self.on_subnet_scan_finished)
+        self.subnet_worker.start()
+
+    def on_subnet_scan_finished(self, found_hosts):
+        self.btn_discover.setEnabled(True)
+        self.btn_scan.setEnabled(True)
+        self.progress_bar.setVisible(False)
+
+        if not found_hosts:
+            self.status_lbl.setText("Tidak ada PC SMB yang ditemukan di subnet lokal.")
+            QMessageBox.information(self, "Hasil Scan LAN", "Tidak ditemukan PC Windows SMB aktif di subnet lokal.")
+            return
+
+        self.status_lbl.setText(f"Ditemukan {len(found_hosts)} PC dengan port SMB aktif di jaringan.")
+
+        # Update ComboBox items
+        current_text = self.host_combo.currentText().strip()
+        for h in reversed(found_hosts):
+            if self.host_combo.findText(h) < 0:
+                self.host_combo.insertItem(0, h)
+
+        if found_hosts:
+            if current_text not in found_hosts:
+                self.host_combo.setCurrentText(found_hosts[0])
+
+    def start_scan(self):
+        host = self.host_combo.currentText().strip()
+        if not host:
+            QMessageBox.warning(self, "Peringatan", "Harap pilih atau masukkan Host/IP Windows.")
+            return
+
+        self.save_host_to_history(host)
+        self.btn_scan.setEnabled(False)
+        self.btn_discover.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.status_lbl.setText(f"Menghubungi {host} dan memindai printer yang dibagikan...")
+
+        username = self.user_input.text().strip() if self.chk_auth.isChecked() else ""
+        password = self.pass_input.text().strip() if self.chk_auth.isChecked() else ""
+
+        self.worker = SmbScanWorker(host, username, password)
+        self.worker.finished.connect(self.on_scan_finished)
+        self.worker.error.connect(self.on_scan_error)
+        self.worker.start()
+
+    def on_scan_finished(self, printers, host):
+        self.btn_scan.setEnabled(True)
+        self.btn_discover.setEnabled(True)
+        self.progress_bar.setVisible(False)
+
+        # Clear scroll layout except stretch at end
+        while self.scroll_layout.count() > 1:
+            item = self.scroll_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not printers:
+            self.status_lbl.setText(f"Tidak ada printer share yang ditemukan di {host}.")
+            self.rescan_btn.setVisible(False)
+            QMessageBox.information(
+                self, "Hasil Pemindaian",
+                f"Tidak ditemukan printer yang dibagikan di '{host}'.\nPastikan fitur 'Share this printer' telah diaktifkan pada Windows."
+            )
+            return
+
+        self.status_lbl.setText(f"Ditemukan {len(printers)} printer share di {host}:")
+        self.rescan_btn.setVisible(True)
+
+        auth_info = {
+            "username": self.user_input.text().strip() if self.chk_auth.isChecked() else "",
+            "password": self.pass_input.text().strip() if self.chk_auth.isChecked() else ""
+        }
+
+        for p in printers:
+            card = PrinterCard(p, auth_info, self.scroll_content)
+            card.status_changed.connect(self.refresh_cards_status)
+            self.scroll_layout.insertWidget(self.scroll_layout.count() - 1, card)
+
+    def on_scan_error(self, err_msg):
+        self.btn_scan.setEnabled(True)
+        self.btn_discover.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.status_lbl.setText("Gagal memindai printer.")
+        QMessageBox.warning(self, "Pemindaian Gagal", err_msg)
+
+    def refresh_cards_status(self):
+        for i in range(self.scroll_layout.count() - 1):
+            widget = self.scroll_layout.itemAt(i).widget()
+            if isinstance(widget, PrinterCard):
+                widget.update_status()
+
+    def open_kde_settings(self):
+        try:
+            subprocess.Popen(["kcmshell6", "kcm_printer_manager"])
+        except Exception:
+            try:
+                subprocess.Popen(["system-config-printer"])
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Tidak dapat membuka pengaturan: {str(e)}")
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+
+    # OCD-friendly, pixel-perfect, WCAG AA compliant stylesheet
+    app.setStyleSheet("""
+        QWidget {
+            font-size: 13px;
+        }
+        QFrame#PrinterCard {
+            border: 1px solid palette(mid);
+            border-radius: 8px;
+            background-color: palette(base);
+        }
+        QFrame#PrinterCard:hover {
+            border: 1px solid #1d99f3;
+        }
+        QFrame#SearchFrame {
+            border: 1px solid palette(mid);
+            border-radius: 8px;
+            background-color: palette(base);
+        }
+        QFrame#EmptyStateFrame {
+            border: 1px dashed palette(mid);
+            border-radius: 8px;
+            background-color: palette(base);
+        }
+        QFrame#IconBox {
+            border: 1px solid palette(mid);
+            border-radius: 8px;
+            background-color: palette(window);
+        }
+        QFrame#HeaderIconBox {
+            border: 1px solid palette(mid);
+            border-radius: 12px;
+            background-color: palette(base);
+        }
+        QLabel#SubText {
+            color: palette(placeholder-text);
+            font-size: 11px;
+        }
+        QLineEdit, QComboBox {
+            border: 1px solid palette(mid);
+            border-radius: 4px;
+            padding: 6px 10px;
+            background-color: palette(base);
+            color: palette(text);
+            min-height: 20px;
+        }
+        QLineEdit:focus, QComboBox:focus {
+            border: 2px solid #1d99f3;
+            padding: 5px 9px;
+        }
+        QPushButton {
+            border: 1px solid palette(mid);
+            border-radius: 4px;
+            padding: 6px 14px;
+            background-color: palette(button);
+            color: palette(button-text);
+            min-height: 18px;
+        }
+        QPushButton:hover {
+            background-color: palette(midlight);
+            border-color: #1d99f3;
+        }
+        QPushButton#PrimaryButton {
+            background-color: #1d99f3;
+            color: #ffffff;
+            border: none;
+            font-weight: bold;
+        }
+        QPushButton#PrimaryButton:hover {
+            background-color: #3daee9;
+        }
+        QPushButton#DangerButton {
+            background-color: transparent;
+            color: #e74c3c;
+            border: 1px solid #e74c3c;
+        }
+        QPushButton#DangerButton:hover {
+            background-color: #e74c3c;
+            color: #ffffff;
+        }
+        QProgressBar {
+            border: none;
+            background-color: palette(midlight);
+            border-radius: 2px;
+        }
+        QProgressBar::chunk {
+            background-color: #1d99f3;
+            border-radius: 2px;
+        }
+    """)
+
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
