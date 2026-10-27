@@ -9,6 +9,7 @@ import os
 import re
 import json
 import socket
+import struct
 import ipaddress
 import urllib.parse
 import subprocess
@@ -33,8 +34,9 @@ DRIVERS = [
     ("drv:///hp/hpcups.drv/hp-laserjet_professional_p1102.ppd", "HP LaserJet P1102 (hpcups)"),
     ("drv:///sample.drv/epson9.ppd", "Epson Dot Matrix 9-Pin (LX-310 / LX-300)"),
     ("drv:///sample.drv/epson24.ppd", "Epson Dot Matrix 24-Pin (LQ Series)"),
-    ("drv:///sample.drv/postscript.ppd", "Generic PostScript Printer"),
-    ("drv:///sample.drv/generic.ppd", "Generic PCL Laser Printer"),
+    ("gutenprint.5.3://escp2-l310/expert", "Epson Inkjet ESC/P2 (L310 / L3210 / L3150)"),
+    ("drv:///sample.drv/generic.ppd", "Generic PostScript Printer"),
+    ("drv:///sample.drv/generpcl.ppd", "Generic PCL Laser Printer"),
     ("raw", "Raw Passthrough (Windows Spooler)"),
 ]
 
@@ -42,6 +44,77 @@ DRIVERS = [
 # ============================================================================
 # Helpers & Utilities
 # ============================================================================
+
+def extract_host(target: str) -> str:
+    """Extract clean IP or hostname from display string like '192.168.41.2 (PMU-ACC1)'"""
+    target = target.strip()
+    m = re.match(r'^(\d{1,3}(?:\.\d{1,3}){3})', target)
+    if m:
+        return m.group(1)
+    m = re.match(r'^([^\s()]+)', target)
+    if m:
+        return m.group(1)
+    return target
+
+
+def get_netbios_name(ip: str, timeout: float = 0.25) -> str:
+    """Query NetBIOS Node Status (RFC 1002) over UDP 137 to resolve Windows Computer Name."""
+    query = (
+        b'\xa2\x48\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+        b'\x20CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x00'
+        b'\x00\x21\x00\x01'
+    )
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(query, (ip, 137))
+        data, _ = s.recvfrom(1024)
+        if len(data) > 57:
+            num_names = data[56]
+            offset = 57
+            for _ in range(num_names):
+                if offset + 18 <= len(data):
+                    name_bytes = data[offset:offset+15]
+                    name_type = data[offset+15]
+                    flags = struct.unpack('>H', data[offset+16:offset+18])[0]
+                    offset += 18
+                    if (flags & 0x8000) == 0 and name_type in (0x00, 0x20):
+                        name = name_bytes.decode('ascii', errors='ignore').strip()
+                        if name:
+                            return name
+    except Exception:
+        pass
+    finally:
+        s.close()
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except Exception:
+        pass
+    return ""
+
+
+def get_active_subnet() -> str:
+    """Detect local active IPv4 network interface CIDR."""
+    try:
+        res = subprocess.run(['ip', '-j', 'addr', 'show', 'up'], capture_output=True, text=True)
+        data = json.loads(res.stdout)
+        for iface in data:
+            if iface.get('ifname') == 'lo':
+                continue
+            for addr in iface.get('addr_info', []):
+                if addr.get('family') == 'inet':
+                    return f"{addr['local']}/{addr['prefixlen']}"
+    except Exception:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return f"{ip}/24"
+    except Exception:
+        return "192.168.25.0/24"
+
 
 def sanitize_cups_name(name: str) -> str:
     cleaned = re.sub(r'[^a-zA-Z0-9_\-]', '_', name)
@@ -57,10 +130,12 @@ def guess_driver_for_name(text: str) -> str:
         return "drv:///sample.drv/epson9.ppd"
     if any(k in lower for k in ["lq-310", "lq-2190", "lq310", "24-pin"]):
         return "drv:///sample.drv/epson24.ppd"
+    if any(k in lower for k in ["l3210", "l3110", "l3150", "l310", "l120", "l210", "l220", "l360", "l380", "l4150", "l5190", "l6190", "l805"]):
+        return "gutenprint.5.3://escp2-l310/expert"
     if "postscript" in lower or "ps" in lower:
-        return "drv:///sample.drv/postscript.ppd"
-    if "laserjet" in lower or "pcl" in lower:
         return "drv:///sample.drv/generic.ppd"
+    if "laserjet" in lower or "pcl" in lower:
+        return "drv:///sample.drv/generpcl.ppd"
     return "drv:///sample.drv/generic.ppd"
 
 
@@ -134,36 +209,33 @@ class SubnetScanWorker(QThread):
 
     def run(self):
         self.status.emit("Mendeteksi antarmuka jaringan lokal...")
-        local_ip = "127.0.0.1"
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("192.168.25.1", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-        except Exception:
-            local_ip = "192.168.25.10"
-
-        net = ipaddress.IPv4Network(f"{local_ip}/24", strict=False)
-        self.status.emit(f"Memindai host SMB di subnet {net.network_address}/24...")
+        cidr = get_active_subnet()
+        net = ipaddress.IPv4Network(cidr, strict=False)
+        self.status.emit(f"Memindai host SMB & nama PC di subnet {net.network_address}/{net.prefixlen}...")
 
         def check_host(ip_str):
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(0.20)
-            try:
-                if sock.connect_ex((ip_str, 445)) == 0:
-                    return ip_str
-            except Exception:
-                pass
-            finally:
-                sock.close()
+            for port in (445, 139):
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.18)
+                try:
+                    if sock.connect_ex((ip_str, port)) == 0:
+                        sock.close()
+                        hostname = get_netbios_name(ip_str)
+                        display = f"{ip_str} ({hostname})" if hostname else ip_str
+                        return {"ip": ip_str, "hostname": hostname, "display": display}
+                except Exception:
+                    pass
+                finally:
+                    sock.close()
             return None
 
-        hosts_to_scan = [str(h) for h in net.hosts()]
+        # Scan up to 256 hosts in subnet
+        hosts_to_scan = [str(h) for h in list(net.hosts())[:256]]
         found = []
-        with ThreadPoolExecutor(max_workers=50) as pool:
-            for ip in pool.map(check_host, hosts_to_scan):
-                if ip:
-                    found.append(ip)
+        with ThreadPoolExecutor(max_workers=40) as pool:
+            for item in pool.map(check_host, hosts_to_scan):
+                if item:
+                    found.append(item)
 
         self.finished.emit(found)
 
@@ -465,7 +537,13 @@ class PrinterCard(QFrame):
             self.status_changed.emit()
             QMessageBox.information(self, "Berhasil", f"Printer '{self.sharename}' berhasil ditambahkan ke CUPS!")
         except subprocess.CalledProcessError as e:
-            QMessageBox.critical(self, "Gagal Menambahkan", f"Error saat menjalankan lpadmin:\n{e.stderr or e.stdout}")
+            err_msg = e.stderr or e.stdout or str(e)
+            if "cups-driverd failed to get PPD" in err_msg:
+                err_msg += (
+                    "\n\nDriver PPD yang dipilih tidak tersedia di CUPS sistem ini."
+                    "\nSaran: Coba ubah Driver ke 'Generic PostScript Printer', 'Generic PCL Laser', atau 'Raw Passthrough'."
+                )
+            QMessageBox.critical(self, "Gagal Menambahkan", f"Error saat menjalankan lpadmin:\n{err_msg}")
 
     def print_test_page(self):
         try:
@@ -765,34 +843,37 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Hasil Scan LAN", "Tidak ditemukan PC Windows SMB aktif di subnet lokal.")
             return
 
-        self.status_lbl.setText(f"Ditemukan {len(found_hosts)} PC dengan port SMB aktif di jaringan.")
+        self.status_lbl.setText(f"Ditemukan {len(found_hosts)} PC Windows/SMB di jaringan lokal.")
 
-        # Update ComboBox items
+        # Update ComboBox items with display string e.g. "192.168.41.2 (PMU-ACC1)"
         current_text = self.host_combo.currentText().strip()
-        for h in reversed(found_hosts):
-            if self.host_combo.findText(h) < 0:
-                self.host_combo.insertItem(0, h)
+        for item in reversed(found_hosts):
+            disp = item["display"]
+            idx = self.host_combo.findText(disp)
+            if idx >= 0:
+                self.host_combo.removeItem(idx)
+            self.host_combo.insertItem(0, disp)
 
-        if found_hosts:
-            if current_text not in found_hosts:
-                self.host_combo.setCurrentText(found_hosts[0])
+        if found_hosts and (not current_text or self.host_combo.findText(current_text) < 0):
+            self.host_combo.setCurrentText(found_hosts[0]["display"])
 
     def start_scan(self):
-        host = self.host_combo.currentText().strip()
-        if not host:
+        raw_target = self.host_combo.currentText().strip()
+        if not raw_target:
             QMessageBox.warning(self, "Peringatan", "Harap pilih atau masukkan Host/IP Windows.")
             return
 
-        self.save_host_to_history(host)
+        clean_host = extract_host(raw_target)
+        self.save_host_to_history(raw_target)
         self.btn_scan.setEnabled(False)
         self.btn_discover.setEnabled(False)
         self.progress_bar.setVisible(True)
-        self.status_lbl.setText(f"Menghubungi {host} dan memindai printer yang dibagikan...")
+        self.status_lbl.setText(f"Menghubungi {raw_target} dan memindai printer yang dibagikan...")
 
         username = self.user_input.text().strip() if self.chk_auth.isChecked() else ""
         password = self.pass_input.text().strip() if self.chk_auth.isChecked() else ""
 
-        self.worker = SmbScanWorker(host, username, password)
+        self.worker = SmbScanWorker(clean_host, username, password)
         self.worker.finished.connect(self.on_scan_finished)
         self.worker.error.connect(self.on_scan_error)
         self.worker.start()
