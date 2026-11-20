@@ -11,12 +11,17 @@ Antarmuka dirancang dengan standar kenyamanan visual (*pixel-perfect*, simetris,
 - **Pencarian Host Otomatis (Subnet Scan LAN):** Memindai subnet lokal (`/24`) secara cepat (< 1 detik) melalui koneksi soket non-blocking port 445 untuk menemukan PC Windows aktif.
 - **Riwayat Host Terintegrasi:** Menyimpan riwayat IP atau hostname Windows yang pernah digunakan ke `~/.config/winprint-connect/history.json`.
 - **Dukungan Autentikasi Windows:** Opsi memasukkan username dan password Windows jika PC target membatasi akses printer.
-- **Deteksi Driver Otomatis:**
-  - HP LaserJet P1102 / P1005 (`hpcups`)
-  - Epson Dot Matrix 9-Pin LX-310 / LX-300 (`epson9`)
-  - Epson Dot Matrix 24-Pin LQ Series (`epson24`)
-  - Generic PostScript & Generic PCL Laser
-  - Raw Passthrough (Windows Spooler)
+- **Deteksi Driver Otomatis dari Katalog CUPS:**
+  - Saat aplikasi dibuka, seluruh PPD yang terpasang dibaca sekali lewat `lpinfo -m` (±8 detik, di latar belakang).
+  - Nama share dicocokkan dengan merek + kode model (mis. `Brother HL-1201` → brlaser `br1200.ppd`,
+    `HP LaserJet Professional P1102` → `hpcups`, `Samsung SCX-3200` → `splix`); hasil teratas ditandai ★.
+  - Bila tidak ada PPD yang cocok, aplikasi **tidak** diam-diam memakai driver generic: kartu menampilkan
+    peringatan dan tombol *Hubungkan* meminta konfirmasi lebih dulu.
+  - Peringatan khusus untuk PPD yang butuh plugin proprietary (`hp-plugin -i`) dan untuk printer
+    host-based (GDI) yang tidak akan mencetak lewat PostScript generic.
+  - Fallback manual tetap tersedia: Epson Dot Matrix 9/24-pin, Generic PostScript, Generic PCL, Raw Passthrough.
+***
+
 - **Manajemen Antrean CUPS Sekali Klik:**
   - Daftarkan printer ke CUPS tanpa perlu mengetahui path URI SMB manual.
   - Cetak halaman pengujian (*Print Test Page*).
@@ -41,6 +46,21 @@ Di Arch Linux / CachyOS:
 ```bash
 sudo pacman -S python-pyside6 smbclient cups
 ```
+
+### Paket driver (opsional, sesuai printer)
+
+Deteksi driver membaca katalog CUPS yang sudah terpasang. Tanpa paket tambahan, printer
+vendor tertentu hanya akan mendapat driver generic dan hasil cetaknya tidak akan keluar.
+
+| Printer | Paket | Sumber |
+|---|---|---|
+| Brother HL/DCP laser (mis. HL-1201) | `brlaser` | AUR |
+| Samsung laser (mis. SCX-3200) | `splix` | AUR |
+| HP LaserJet (mis. P1102) | `hplip` + plugin via `sudo hp-plugin -i` | repo + plugin manual |
+| Epson inkjet L-series | `epson-inkjet-printer-escpr2` | AUR |
+| Epson L3210 / L3200 / L1210 | `epson-inkjet-printer-202101w` | AUR |
+
+Setelah memasang paket, jalankan ulang aplikasi agar katalog `lpinfo -m` dimuat lagi.
 
 ---
 

@@ -33,14 +33,32 @@ DEFAULT_HOST = "192.168.25.5"
 
 DRIVERS = [
     ("auto", "Deteksi Otomatis (Rekomendasi)"),
-    ("drv:///hp/hpcups.drv/hp-laserjet_professional_p1102.ppd", "HP LaserJet P1102 (hpcups)"),
     ("drv:///sample.drv/epson9.ppd", "Epson Dot Matrix 9-Pin (LX-310 / LX-300)"),
     ("drv:///sample.drv/epson24.ppd", "Epson Dot Matrix 24-Pin (LQ Series)"),
-    ("gutenprint.5.3://escp2-l310/expert", "Epson Inkjet ESC/P2 (L310 / L3210 / L3150)"),
     ("drv:///sample.drv/generic.ppd", "Generic PostScript Printer"),
     ("drv:///sample.drv/generpcl.ppd", "Generic PCL Laser Printer"),
     ("raw", "Raw Passthrough (Windows Spooler)"),
 ]
+
+# Katalog driver nyata dari `lpinfo -m`, diisi DriverCatalogWorker saat start.
+DRIVER_CATALOG = []
+DRIVER_CATALOG_VERSION = 0
+
+GENERIC_DRIVER_KEYS = {
+    "auto", "raw",
+    "drv:///sample.drv/epson9.ppd",
+    "drv:///sample.drv/epson24.ppd",
+    "drv:///sample.drv/generic.ppd",
+    "drv:///sample.drv/generpcl.ppd",
+}
+
+BRAND_TOKENS = (
+    "hewlett", "hp", "brother", "epson", "canon", "samsung", "lexmark", "xerox",
+    "ricoh", "kyocera", "konica", "minolta", "sharp", "toshiba", "oki", "dell",
+    "lenovo", "pantum", "fuji", "zebra", "dymo", "citizen",
+)
+
+_MODEL_CODE_RE = re.compile(r"([a-z]{1,5})\s*-?\s*(\d{3,6})([a-z]{0,2})")
 
 PAPERCUT_IPP_PORTS = [(9163, "http", "ipp"), (9164, "https", "ipps")]
 PAPERCUT_WEB_PORTS = [(9191, "http"), (9192, "https")]
@@ -128,21 +146,122 @@ def sanitize_cups_name(name: str) -> str:
     return cleaned or "printer"
 
 
-def guess_driver_for_name(text: str) -> str:
+def parse_model_codes(text: str):
+    """Return (brand token, [(prefix, digits, suffix), ...]) for a printer name or PPD label."""
     lower = text.lower()
-    if "p1102" in lower or "laserjet professional" in lower:
-        return "drv:///hp/hpcups.drv/hp-laserjet_professional_p1102.ppd"
-    if any(k in lower for k in ["lx-310", "lx-300", "lx310", "lx300", "epson 9", "9-pin", "dot matrix"]):
-        return "drv:///sample.drv/epson9.ppd"
-    if any(k in lower for k in ["lq-310", "lq-2190", "lq310", "24-pin"]):
-        return "drv:///sample.drv/epson24.ppd"
-    if any(k in lower for k in ["l3210", "l3110", "l3150", "l310", "l120", "l210", "l220", "l360", "l380", "l4150", "l5190", "l6190", "l805"]):
-        return "gutenprint.5.3://escp2-l310/expert"
-    if "postscript" in lower or "ps" in lower:
-        return "drv:///sample.drv/generic.ppd"
-    if "laserjet" in lower or "pcl" in lower:
-        return "drv:///sample.drv/generpcl.ppd"
+    brand = next((t for t in BRAND_TOKENS if t in lower), "")
+    codes = [(m.group(1), m.group(2), m.group(3)) for m in _MODEL_CODE_RE.finditer(lower)]
+    return brand, codes
+
+
+def match_catalog_driver(text: str, limit: int = 12):
+    """Rank installed CUPS drivers against a share name using brand + model code."""
+    if not DRIVER_CATALOG or not text:
+        return []
+    brand, want = parse_model_codes(text)
+    if not want:
+        return []
+    scored = []
+    for key, label in DRIVER_CATALOG:
+        drv_brand, have = parse_model_codes(label)
+        if brand and drv_brand and drv_brand != brand:
+            continue
+        for w_prefix, w_digits, w_suffix in want:
+            for d_prefix, d_digits, d_suffix in have:
+                if w_prefix != d_prefix:
+                    continue
+                # Same generation: equal length and equal leading group (HL-1201 ~ HL-1200).
+                if len(w_digits) != len(d_digits) or w_digits[:3] != d_digits[:3]:
+                    continue
+                scored.append((
+                    (
+                        d_digits == w_digits and d_suffix == w_suffix,
+                        d_digits == w_digits,
+                        not d_suffix,
+                        drv_brand == brand,
+                        key.startswith("drv://"),
+                        -len(label),
+                    ),
+                    key,
+                    label,
+                ))
+                break
+    scored.sort(key=lambda item: item[0], reverse=True)
+    results, seen = [], set()
+    for _, key, label in scored:
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append((key, label))
+        if len(results) >= limit:
+            break
+    return results
+
+
+def guess_driver_for_name(text: str) -> str:
+    """Pick the best installed driver for a share; fall back to generic PostScript."""
+    matches = match_catalog_driver(text, limit=1)
+    if matches:
+        return matches[0][0]
     return "drv:///sample.drv/generic.ppd"
+
+
+def driver_warnings(key: str, share_name: str):
+    """Return user-facing warnings about a chosen driver."""
+    warnings = []
+    brand, _ = parse_model_codes(share_name)
+    label = next((lbl for k, lbl in DRIVER_CATALOG if k == key), "")
+    if "requires proprietary plugin" in label.lower():
+        warnings.append(
+            "PPD ini butuh plugin proprietary HP. Bila plugin belum terdaftar, job akan "
+            "gagal senyap; jalankan `hp-plugin -i` lalu cetak ulang."
+        )
+    if brand in ("brother", "canon", "samsung", "lexmark") and not key.startswith(("drv:///brlaser", "drv:///splix")):
+        # These vendors ship host-based (GDI) lasers far more often than PostScript ones.
+        warnings.append(
+            f"Kebanyakan laser {brand.title()} bersifat host-based (GDI), bukan PostScript/PCL. "
+            "Job dari PPD generic akan terkirim tapi tidak tercetak. Pastikan PPD model asli "
+            "(mis. brlaser untuk Brother HL/DCP, splix untuk Samsung) benar-benar terdaftar."
+        )
+    if key in ("drv:///sample.drv/generic.ppd", "drv:///sample.drv/generpcl.ppd") and brand:
+        if DRIVER_CATALOG and not match_catalog_driver(share_name):
+            warnings.append(
+                "Tidak ada PPD spesifik model ini di katalog CUPS; yang dipilih hanya driver generic. "
+                "Cek driver resmi vendor (mis. epson-inkjet-printer-escpr/-202101w, brlaser, hplip) "
+                "sebelum menghubungkan."
+            )
+    if key.startswith("gutenprint") and brand == "epson":
+        warnings.append(
+            "PPD Gutenprint hanya mendekati model asli. Bila hasil cetak kabur atau warna "
+            "salah, pasang PPD resmi Epson (epson-inkjet-printer-escpr / -202101w)."
+        )
+    return warnings
+
+
+def load_driver_catalog():
+    """Query CUPS for every installed driver; tolerant of a missing lpinfo."""
+    global DRIVER_CATALOG, DRIVER_CATALOG_VERSION
+    catalog, seen = [], set()
+    try:
+        res = subprocess.run(["lpinfo", "-m"], capture_output=True, text=True, timeout=60)
+        for line in res.stdout.splitlines():
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            key, label = parts[0].strip(), parts[1].strip()
+            if key == "raw" or key in GENERIC_DRIVER_KEYS:
+                continue
+            # The same PPD is listed as drv:///... and as lsb/usr/...gz; keep the drv:// form.
+            basename = os.path.basename(key).removesuffix(".gz").removesuffix(".ppd")
+            if basename in seen:
+                continue
+            seen.add(basename)
+            catalog.append((key, label))
+    except Exception:
+        pass
+    DRIVER_CATALOG = catalog
+    DRIVER_CATALOG_VERSION += 1
+    return catalog
 
 
 def get_installed_cups_printers() -> dict:
@@ -416,6 +535,17 @@ class PaperCutProbeWorker(QThread):
             )
 
 
+class DriverCatalogWorker(QThread):
+    finished = Signal(int)
+
+    def run(self):
+        try:
+            count = len(load_driver_catalog())
+        except Exception:
+            count = 0
+        self.finished.emit(count)
+
+
 # ============================================================================
 # UI Component: PrinterCard
 # ============================================================================
@@ -534,18 +664,18 @@ class PrinterCard(QFrame):
         else:
             self.drv_combo = QComboBox(self)
             self.drv_combo.setToolTip("Pilih driver pencocokan untuk printer ini")
-            for val, label in DRIVERS:
-                self.drv_combo.addItem(label, val)
-
-            guessed = guess_driver_for_name(self.sharename + " " + self.comment)
-            idx = self.drv_combo.findData(guessed)
-            if idx >= 0:
-                self.drv_combo.setCurrentIndex(idx)
-
+            self.drv_combo.currentIndexChanged.connect(self._on_driver_changed)
+            self.drv_warn_lbl = QLabel("", self)
+            self.drv_warn_lbl.setObjectName("WarnText")
+            self.drv_warn_lbl.setWordWrap(True)
+            self.drv_warn_lbl.setVisible(False)
             drv_row.addWidget(drv_tag)
             drv_row.addWidget(self.drv_combo)
+            self._populate_driver_combo()
         drv_row.addStretch()
         info_layout.addLayout(drv_row)
+        if self.kind != "papercut":
+            info_layout.addWidget(self.drv_warn_lbl)
 
         layout.addLayout(info_layout, stretch=1)
 
@@ -591,6 +721,56 @@ class PrinterCard(QFrame):
 
         layout.addLayout(self.btn_layout)
         self.update_status()
+
+    def _selected_driver(self):
+        if self.drv_combo is None:
+            return None
+        key = self.drv_combo.currentData()
+        if key == "auto":
+            matches = match_catalog_driver(self.sharename + " " + self.comment, limit=1)
+            key = matches[0][0] if matches else "drv:///sample.drv/generic.ppd"
+        return key
+
+    def _populate_driver_combo(self, keep_selection=False):
+        """Fill the combo with generic fallbacks plus every installed CUPS driver."""
+        if self.drv_combo is None:
+            return
+        previous = self.drv_combo.currentData() if keep_selection else None
+        matches = match_catalog_driver(self.sharename + " " + self.comment, limit=12)
+        best_key = matches[0][0] if matches else None
+
+        self.drv_combo.blockSignals(True)
+        self.drv_combo.clear()
+        self.drv_combo.addItem("Deteksi Otomatis (Rekomendasi)", "auto")
+        if matches:
+            label = matches[0][1]
+            self.drv_combo.addItem(f"★ {label}", matches[0][0])
+        for key, label in matches[1:]:
+            self.drv_combo.addItem(label, key)
+        self.drv_combo.insertSeparator(self.drv_combo.count())
+        for key, label in DRIVERS[1:]:
+            self.drv_combo.addItem(label, key)
+        self.drv_combo.blockSignals(False)
+
+        target = previous or "auto"
+        idx = self.drv_combo.findData(target)
+        if idx < 0 and best_key:
+            idx = self.drv_combo.findData(best_key)
+        self.drv_combo.setCurrentIndex(max(idx, 0))
+        self._on_driver_changed()
+
+    def refresh_driver_catalog(self):
+        """Repopulate after the background catalog load finished."""
+        if self.drv_combo is not None:
+            self._populate_driver_combo(keep_selection=True)
+
+    def _on_driver_changed(self):
+        if self.drv_combo is None or not hasattr(self, "drv_warn_lbl"):
+            return
+        key = self._selected_driver()
+        warnings = driver_warnings(key, self.sharename) if key else []
+        self.drv_warn_lbl.setText("\n".join(warnings))
+        self.drv_warn_lbl.setVisible(bool(warnings))
 
     def update_status(self):
         installed = get_installed_cups_printers()
@@ -667,9 +847,21 @@ class PrinterCard(QFrame):
                 "-o", "auth-info-required=username,password",
             ]
         else:
-            driver = self.drv_combo.currentData()
-            if driver == "auto":
-                driver = guess_driver_for_name(self.sharename + " " + self.comment)
+            driver = self._selected_driver()
+            if driver in ("drv:///sample.drv/generic.ppd", "drv:///sample.drv/generpcl.ppd"):
+                brand, _ = parse_model_codes(self.sharename)
+                if brand and not match_catalog_driver(self.sharename, limit=1):
+                    reply = QMessageBox.question(
+                        self, "Driver Kemungkinan Salah",
+                        f"Tidak ada PPD khusus untuk '{self.sharename}' di katalog CUPS.\n"
+                        f"Driver generic hanya cocok untuk printer PostScript/PCL sejati; "
+                        f"printer host-based (GDI) akan menerima job tetapi tidak mencetak.\n\n"
+                        f"Tetap hubungkan dengan driver generic?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No,
+                    )
+                    if reply != QMessageBox.StandardButton.Yes:
+                        return
             quoted_share = urllib.parse.quote(self.sharename)
             if username and password:
                 uri = f"smb://{username}:{password}@{self.host}/{quoted_share}"
@@ -752,7 +944,10 @@ class MainWindow(QMainWindow):
         self.smb_scan_done = True
         self.papercut_probe_host = None
         self.pc_workers = []
+        self.catalog_worker = None
+        self.catalog_count = 0
         self.init_ui()
+        self.start_driver_catalog_load()
 
     def init_ui(self):
         central = QWidget(self)
@@ -985,6 +1180,21 @@ class MainWindow(QMainWindow):
         footer_layout.addWidget(btn_close)
 
         main_layout.addLayout(footer_layout)
+
+    def start_driver_catalog_load(self):
+        """Load `lpinfo -m` off the UI thread; it takes ~8s on a full CUPS install."""
+        self.catalog_worker = DriverCatalogWorker()
+        self.catalog_worker.finished.connect(self.on_driver_catalog_loaded)
+        self.catalog_worker.start()
+
+    def on_driver_catalog_loaded(self, count):
+        self.catalog_count = count
+        for i in range(self.scroll_layout.count()):
+            widget = self.scroll_layout.itemAt(i).widget()
+            if isinstance(widget, PrinterCard):
+                widget.refresh_driver_catalog()
+        if count:
+            self.status_lbl.setToolTip(f"Katalog driver CUPS: {count} PPD terpasang")
 
     def toggle_auth_fields(self, checked):
         self.auth_widget.setVisible(checked)
@@ -1279,6 +1489,10 @@ def main():
         }
         QLabel#SubText {
             color: palette(placeholder-text);
+            font-size: 11px;
+        }
+        QLabel#WarnText {
+            color: #e5a00d;
             font-size: 11px;
         }
         QLineEdit, QComboBox {
