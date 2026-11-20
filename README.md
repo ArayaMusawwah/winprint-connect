@@ -23,6 +23,10 @@ Antarmuka dirancang dengan standar kenyamanan visual (*pixel-perfect*, simetris,
   - Tentukan printer utama (*Set as Default*).
   - Hapus antrean printer jika sudah tidak digunakan.
   - Tautan langsung ke antarmuka web CUPS (`http://localhost:631/printers/`) dan pengaturan printer KDE.
+- **Integrasi PaperCut:** mendeteksi PaperCut Mobility Print (port 9163/9164) dan mendaftarkan
+  semua antreannya ke CUPS sebagai *IPP Everywhere* driverless (tanpa driver PPD), mendeteksi
+  server PaperCut NG/MF (share `PCClient`, console 9191/9192), dan menyediakan tombol
+  **Akun PaperCut** untuk membuka halaman kuota pengguna.
 
 ---
 
@@ -60,6 +64,20 @@ cd winprint-connect
   ```
 - Dari **Menu Aplikasi KDE / KRunner (`Alt+Space`)**:
   Ketik `WinPrint Connect`.
+
+---
+
+## Catatan PaperCut
+
+- Antrean PaperCut dibuat dengan `auth-info-required=username,password`: saat mencetak pertama
+  kali, CUPS meminta username/password PaperCut. Isi kolom akun Windows sebelum menekan
+  "Hubungkan" agar kredensial ikut tertanam pada URI perangkat dan billing langsung tepat.
+- Kuota/akun: tombol **Akun PaperCut** membuka `http(s)://<host>:9191|9192/user`.
+- Batasan: finishing/staple tidak didukung Mobility Print. Bila server mengabaikan ukuran
+  kertas/duplex dari dialog, paksa lewat
+  `lp -d <antrean> -o media=ISO_A3 -o sides=two-sided-long-edge file.pdf`.
+- PaperCut User Client (popup saldo/account selection) tidak dipasang otomatis oleh aplikasi
+  ini; pasang manual dari `\\<server>\PCClient` bila diperlukan.
 
 ---
 

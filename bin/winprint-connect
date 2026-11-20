@@ -12,6 +12,8 @@ import socket
 import struct
 import ipaddress
 import urllib.parse
+import urllib.request
+import ssl
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
@@ -39,6 +41,10 @@ DRIVERS = [
     ("drv:///sample.drv/generpcl.ppd", "Generic PCL Laser Printer"),
     ("raw", "Raw Passthrough (Windows Spooler)"),
 ]
+
+PAPERCUT_IPP_PORTS = [(9163, "http", "ipp"), (9164, "https", "ipps")]
+PAPERCUT_WEB_PORTS = [(9191, "http"), (9192, "https")]
+PAPERCUT_CLIENT_SHARE = "pcclient"
 
 
 # ============================================================================
@@ -165,6 +171,108 @@ def get_default_cups_printer() -> str:
     return ""
 
 
+def port_open(host: str, port: int, timeout: float = 0.4) -> bool:
+    """Probe a single TCP port without raising."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        return s.connect_ex((host, port)) == 0
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+
+def fetch_papercut_printers(host: str, port: int, scheme: str) -> list:
+    """GET {scheme}://{host}:{port}/printers and return [{'name': ...}]."""
+    url = f"{scheme}://{host}:{port}/printers"
+    ctx = None
+    if scheme == "https":
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(url, timeout=5, context=ctx) as r:
+            data = json.loads(r.read())
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    seen = set()
+    printers = []
+    for item in data:
+        if isinstance(item, dict):
+            name = item.get("name")
+        elif isinstance(item, str):
+            name = item
+        else:
+            continue
+        if not isinstance(name, str):
+            continue
+        name = name.strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        printers.append({"name": name})
+    return printers
+
+
+def papercut_device_uri(host, port, scheme, name, username="", password="") -> str:
+    """Build the CUPS device URI for a PaperCut Mobility Print queue."""
+    ipp_name = name.replace(" ", "+")
+    if username and password:
+        auth = f"{urllib.parse.quote(username)}:{urllib.parse.quote(password)}@"
+    elif username:
+        auth = f"{urllib.parse.quote(username)}@"
+    else:
+        auth = ""
+    return f"{scheme}://{auth}{host}:{port}/printers/{ipp_name}"
+
+
+def probe_papercut(host: str) -> dict:
+    """Detect PaperCut Mobility Print (IPP) and NG/MF console on host."""
+    result = {"host": host, "ipp_port": None, "ipp_scheme": None, "web_url": None, "printers": []}
+    if not host:
+        return result
+
+    try:
+        for port, http_scheme, ipp_scheme in PAPERCUT_IPP_PORTS:
+            if not port_open(host, port):
+                continue
+            printers = fetch_papercut_printers(host, port, http_scheme)
+            if printers:
+                result["ipp_port"] = port
+                result["ipp_scheme"] = ipp_scheme
+                result["printers"] = printers
+                break
+    except Exception:
+        pass
+
+    try:
+        for port, http_scheme in PAPERCUT_WEB_PORTS:
+            if port_open(host, port):
+                result["web_url"] = f"{http_scheme}://{host}:{port}/user"
+                break
+    except Exception:
+        pass
+
+    return result
+
+
+def parse_smb_listing(output: str):
+    """Split `smbclient -L` output into (printer shares, disk share names)."""
+    printers, disks = [], []
+    for line in output.splitlines():
+        m = re.match(r"^\t(?!.*?\bDisk\b)(.*?)\s+Printer\s*(.*)$", line)
+        if m:
+            printers.append({"sharename": m.group(1).strip(), "comment": m.group(2).strip()})
+            continue
+        m = re.match(r"^\t(.*?)\s+Disk\s*(.*)$", line)
+        if m:
+            disks.append(m.group(1).strip())
+    return printers, disks
+
+
 # ============================================================================
 # Configuration Management
 # ============================================================================
@@ -249,6 +357,7 @@ class SmbScanWorker(QThread):
         self.host = host.strip()
         self.username = username.strip()
         self.password = password.strip()
+        self.disk_shares = []
 
     def run(self):
         if not self.host:
@@ -278,23 +387,33 @@ class SmbScanWorker(QThread):
                 self.error.emit("Akses ditolak: Windows memerlukan akun/password untuk melihat printer.")
                 return
 
-            printers = []
-            for line in output.splitlines():
-                m = re.match(r"^\t(?!.*?\bDisk\b)(.*?)\s+Printer\s*(.*)$", line)
-                if m:
-                    sharename = m.group(1).strip()
-                    comment = m.group(2).strip()
-                    printers.append({
-                        "sharename": sharename,
-                        "comment": comment,
-                        "host": self.host
-                    })
+            printers, self.disk_shares = parse_smb_listing(output)
+            for p in printers:
+                p["host"] = self.host
 
             self.finished.emit(printers, self.host)
         except subprocess.TimeoutExpired:
             self.error.emit(f"Koneksi timeout ke {self.host}. Pastikan PC Windows menyala dan port SMB terbuka.")
         except Exception as e:
             self.error.emit(f"Error memindai: {str(e)}")
+
+
+class PaperCutProbeWorker(QThread):
+    finished = Signal(dict, str)
+
+    def __init__(self, host):
+        super().__init__()
+        self.host = host.strip()
+
+    def run(self):
+        try:
+            self.finished.emit(probe_papercut(self.host), self.host)
+        except Exception:
+            self.finished.emit(
+                {"host": self.host, "ipp_port": None, "ipp_scheme": None,
+                 "web_url": None, "printers": []},
+                self.host,
+            )
 
 
 # ============================================================================
@@ -308,10 +427,18 @@ class PrinterCard(QFrame):
         super().__init__(parent)
         self.printer_info = printer_info
         self.auth_info = auth_info
-        self.sharename = printer_info["sharename"]
-        self.comment = printer_info["comment"] or "Shared Windows Printer"
+        self.kind = printer_info.get("kind", "smb")
         self.host = printer_info["host"]
-        self.cups_name = sanitize_cups_name(self.sharename)
+        if self.kind == "papercut":
+            self.sharename = printer_info["name"]
+            self.comment = "Antrean PaperCut"
+            self.pp_port = printer_info["port"]
+            self.pp_scheme = printer_info["scheme"]
+            self.cups_name = sanitize_cups_name(self.sharename)
+        else:
+            self.sharename = printer_info["sharename"]
+            self.comment = printer_info["comment"] or "Shared Windows Printer"
+            self.cups_name = sanitize_cups_name(self.sharename)
         self.init_ui()
 
     def init_ui(self):
@@ -372,6 +499,19 @@ class PrinterCard(QFrame):
         self.default_badge_lbl.setVisible(False)
         title_row.addWidget(self.default_badge_lbl)
 
+        if self.kind == "papercut":
+            self.pp_badge_lbl = QLabel("  PAPERCUT  ", self)
+            self.pp_badge_lbl.setStyleSheet("""
+                background-color: #8e44ad;
+                color: #ffffff;
+                border-radius: 4px;
+                padding: 2px 6px;
+                font-weight: bold;
+                font-size: 10px;
+            """)
+            self.pp_badge_lbl.setToolTip("Antrean dikelola PaperCut - biaya cetak dihitung server PaperCut")
+            title_row.addWidget(self.pp_badge_lbl)
+
         title_row.addStretch()
         info_layout.addLayout(title_row)
 
@@ -385,18 +525,25 @@ class PrinterCard(QFrame):
         drv_row.setSpacing(8)
         drv_tag = QLabel("Driver:", self)
         drv_tag.setObjectName("SubText")
-        self.drv_combo = QComboBox(self)
-        self.drv_combo.setToolTip("Pilih driver pencocokan untuk printer ini")
-        for val, label in DRIVERS:
-            self.drv_combo.addItem(label, val)
+        if self.kind == "papercut":
+            self.drv_combo = None
+            drv_row.addWidget(drv_tag)
+            drv_note = QLabel("IPP Everywhere (driverless)", self)
+            drv_note.setObjectName("SubText")
+            drv_row.addWidget(drv_note)
+        else:
+            self.drv_combo = QComboBox(self)
+            self.drv_combo.setToolTip("Pilih driver pencocokan untuk printer ini")
+            for val, label in DRIVERS:
+                self.drv_combo.addItem(label, val)
 
-        guessed = guess_driver_for_name(self.sharename + " " + self.comment)
-        idx = self.drv_combo.findData(guessed)
-        if idx >= 0:
-            self.drv_combo.setCurrentIndex(idx)
+            guessed = guess_driver_for_name(self.sharename + " " + self.comment)
+            idx = self.drv_combo.findData(guessed)
+            if idx >= 0:
+                self.drv_combo.setCurrentIndex(idx)
 
-        drv_row.addWidget(drv_tag)
-        drv_row.addWidget(self.drv_combo)
+            drv_row.addWidget(drv_tag)
+            drv_row.addWidget(self.drv_combo)
         drv_row.addStretch()
         info_layout.addLayout(drv_row)
 
@@ -448,13 +595,21 @@ class PrinterCard(QFrame):
     def update_status(self):
         installed = get_installed_cups_printers()
         default_printer = get_default_cups_printer()
-        quoted = urllib.parse.quote(self.sharename).lower()
-        raw = self.sharename.lower()
-
         matched_cups_name = None
         if self.cups_name in installed:
             matched_cups_name = self.cups_name
+        elif self.kind == "papercut":
+            needles = (
+                f"/printers/{self.sharename.replace(' ', '+')}",
+                f"/printers/{urllib.parse.quote(self.sharename)}",
+            )
+            for cname, uri in installed.items():
+                if self.host in uri and any(n in uri for n in needles):
+                    matched_cups_name = cname
+                    break
         else:
+            quoted = urllib.parse.quote(self.sharename).lower()
+            raw = self.sharename.lower()
             for cname, uri in installed.items():
                 uri_l = uri.lower()
                 if (quoted in uri_l or raw in uri_l) and self.host in uri_l:
@@ -483,7 +638,8 @@ class PrinterCard(QFrame):
             self.btn_test.setVisible(True)
             self.btn_default.setVisible(True)
             self.btn_remove.setVisible(True)
-            self.drv_combo.setEnabled(False)
+            if self.kind == "smb":
+                self.drv_combo.setEnabled(False)
         else:
             self.badge_lbl.setVisible(False)
             self.default_badge_lbl.setVisible(False)
@@ -494,40 +650,41 @@ class PrinterCard(QFrame):
             self.btn_test.setVisible(False)
             self.btn_default.setVisible(False)
             self.btn_remove.setVisible(False)
-            self.drv_combo.setEnabled(True)
+            if self.kind == "smb":
+                self.drv_combo.setEnabled(True)
 
     def connect_printer(self):
-        driver = self.drv_combo.currentData()
-        if driver == "auto":
-            driver = guess_driver_for_name(self.sharename + " " + self.comment)
-
-        quoted_share = urllib.parse.quote(self.sharename)
         username = self.auth_info.get("username", "").strip()
         password = self.auth_info.get("password", "").strip()
 
-        if username and password:
-            uri = f"smb://{username}:{password}@{self.host}/{quoted_share}"
-        elif username:
-            uri = f"smb://{username}@{self.host}/{quoted_share}"
+        if self.kind == "papercut":
+            uri = papercut_device_uri(self.host, self.pp_port, self.pp_scheme,
+                                      self.sharename, username, password)
+            cmd = [
+                "lpadmin", "-p", self.cups_name, "-E", "-v", uri,
+                "-D", self.sharename, "-L", f"PaperCut ({self.host})",
+                "-m", "everywhere",
+                "-o", "auth-info-required=username,password",
+            ]
         else:
-            uri = f"smb://{self.host}/{quoted_share}"
-
-        cmd = [
-            "lpadmin",
-            "-p", self.cups_name,
-            "-E",
-            "-v", uri,
-            "-D", f"{self.sharename} di {self.host}",
-            "-L", f"Windows PC ({self.host})",
-        ]
-
-        if driver == "raw":
-            cmd.extend(["-m", "raw"])
-        else:
-            cmd.extend(["-m", driver])
-
-        if not (username and password):
-            cmd.extend(["-o", "auth-info-required=username,password"])
+            driver = self.drv_combo.currentData()
+            if driver == "auto":
+                driver = guess_driver_for_name(self.sharename + " " + self.comment)
+            quoted_share = urllib.parse.quote(self.sharename)
+            if username and password:
+                uri = f"smb://{username}:{password}@{self.host}/{quoted_share}"
+            elif username:
+                uri = f"smb://{username}@{self.host}/{quoted_share}"
+            else:
+                uri = f"smb://{self.host}/{quoted_share}"
+            cmd = [
+                "lpadmin", "-p", self.cups_name, "-E", "-v", uri,
+                "-D", f"{self.sharename} di {self.host}",
+                "-L", f"Windows PC ({self.host})",
+            ]
+            cmd.extend(["-m", "raw" if driver == "raw" else driver])
+            if not (username and password):
+                cmd.extend(["-o", "auth-info-required=username,password"])
 
         try:
             subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -590,6 +747,11 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(680, 500)
         self.setWindowIcon(QIcon.fromTheme("printer", QIcon.fromTheme("network-wired")))
         self.cfg = ConfigManager.load()
+        self.papercut_web_url = None
+        self.papercut_pending = None
+        self.smb_scan_done = True
+        self.papercut_probe_host = None
+        self.pc_workers = []
         self.init_ui()
 
     def init_ui(self):
@@ -632,6 +794,15 @@ class MainWindow(QMainWindow):
 
         header_layout.addLayout(head_text_layout)
         header_layout.addStretch()
+
+        # Akun PaperCut quick link button (enabled after detection)
+        self.btn_papercut_web = QPushButton("  Akun PaperCut", self)
+        self.btn_papercut_web.setIcon(QIcon.fromTheme("x-office-address-book"))
+        self.btn_papercut_web.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_papercut_web.setToolTip("Buka halaman akun/kuota PaperCut di browser")
+        self.btn_papercut_web.setEnabled(False)
+        self.btn_papercut_web.clicked.connect(self.open_papercut_account)
+        header_layout.addWidget(self.btn_papercut_web)
 
         # Web CUPS quick link button
         btn_cups_web = QPushButton("Web CUPS", self)
@@ -682,6 +853,15 @@ class MainWindow(QMainWindow):
         self.btn_scan.setToolTip("Cari printer yang dibagikan pada host ini")
         self.btn_scan.clicked.connect(self.start_scan)
 
+        # PaperCut manual probe button (Secondary)
+        self.btn_papercut = QPushButton("  PaperCut", self)
+        self.btn_papercut.setIcon(QIcon.fromTheme("applications-internet"))
+        self.btn_papercut.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_papercut.setToolTip(
+            "Deteksi PaperCut Mobility Print (9163/9164) atau NG/MF (9191/9192) di host ini"
+        )
+        self.btn_papercut.clicked.connect(self.start_papercut_probe)
+
         # Auto-Discover LAN button (Secondary)
         self.btn_discover = QPushButton("  Scan LAN", self)
         self.btn_discover.setIcon(QIcon.fromTheme("network-workgroup", QIcon.fromTheme("network-wired")))
@@ -692,8 +872,8 @@ class MainWindow(QMainWindow):
         host_row.addWidget(host_lbl)
         host_row.addWidget(self.host_combo, stretch=1)
         host_row.addWidget(self.btn_scan)
+        host_row.addWidget(self.btn_papercut)
         host_row.addWidget(self.btn_discover)
-        sf_layout.addLayout(host_row)
 
         # Optional Auth Row
         self.chk_auth = QCheckBox("Gunakan Akun Windows (Bila Printer Memerlukan Username & Password)", self)
@@ -809,6 +989,15 @@ class MainWindow(QMainWindow):
     def toggle_auth_fields(self, checked):
         self.auth_widget.setVisible(checked)
 
+    def _auth_username(self):
+        return self.user_input.text().strip() if self.chk_auth.isChecked() else ""
+
+    def _auth_password(self):
+        return self.pass_input.text().strip() if self.chk_auth.isChecked() else ""
+
+    def _auth_info(self):
+        return {"username": self._auth_username(), "password": self._auth_password()}
+
     def save_host_to_history(self, host):
         recent = self.cfg.get("recent_hosts", [])
         if host in recent:
@@ -857,6 +1046,19 @@ class MainWindow(QMainWindow):
         if found_hosts and (not current_text or self.host_combo.findText(current_text) < 0):
             self.host_combo.setCurrentText(found_hosts[0]["display"])
 
+    def start_papercut_probe(self):
+        raw_target = self.host_combo.currentText().strip()
+        if not raw_target:
+            QMessageBox.warning(self, "Peringatan", "Harap pilih atau masukkan Host/IP Windows.")
+            return
+        host = extract_host(raw_target)
+        self.save_host_to_history(raw_target)
+        self.clear_papercut_cards()
+        self.btn_papercut.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.status_lbl.setText(f"Mendeteksi PaperCut di {host}...")
+        self._start_papercut_probe(host, silent=False)
+
     def start_scan(self):
         raw_target = self.host_combo.currentText().strip()
         if not raw_target:
@@ -873,21 +1075,37 @@ class MainWindow(QMainWindow):
         username = self.user_input.text().strip() if self.chk_auth.isChecked() else ""
         password = self.pass_input.text().strip() if self.chk_auth.isChecked() else ""
 
+        self.smb_scan_done = False
+        self._start_papercut_probe(clean_host, silent=True)
+
         self.worker = SmbScanWorker(clean_host, username, password)
         self.worker.finished.connect(self.on_scan_finished)
         self.worker.error.connect(self.on_scan_error)
         self.worker.start()
 
+    def _start_papercut_probe(self, host, silent):
+        self.papercut_probe_host = host
+        worker = PaperCutProbeWorker(host)
+        self.pc_workers.append(worker)
+        worker.finished.connect(
+            lambda result, h, s=silent: self.on_papercut_result(result, h, s)
+        )
+        worker.start()
+
     def on_scan_finished(self, printers, host):
+        self.smb_scan_done = True
         self.btn_scan.setEnabled(True)
         self.btn_discover.setEnabled(True)
         self.progress_bar.setVisible(False)
 
-        # Clear scroll layout except stretch at end
-        while self.scroll_layout.count() > 1:
-            item = self.scroll_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        # Clear only printer cards; keep the empty-state placeholder and trailing stretch
+        for i in range(self.scroll_layout.count() - 1, -1, -1):
+            widget = self.scroll_layout.itemAt(i).widget()
+            if isinstance(widget, PrinterCard):
+                self.scroll_layout.takeAt(i)
+                widget.deleteLater()
+
+        self.apply_papercut_share_fallback(host, getattr(self.worker, "disk_shares", []))
 
         if not printers:
             self.status_lbl.setText(f"Tidak ada printer share yang ditemukan di {host}.")
@@ -896,27 +1114,115 @@ class MainWindow(QMainWindow):
                 self, "Hasil Pemindaian",
                 f"Tidak ditemukan printer yang dibagikan di '{host}'.\nPastikan fitur 'Share this printer' telah diaktifkan pada Windows."
             )
+            self._sync_empty_state()
+            self._flush_papercut_pending()
             return
 
         self.status_lbl.setText(f"Ditemukan {len(printers)} printer share di {host}:")
         self.rescan_btn.setVisible(True)
 
-        auth_info = {
-            "username": self.user_input.text().strip() if self.chk_auth.isChecked() else "",
-            "password": self.pass_input.text().strip() if self.chk_auth.isChecked() else ""
-        }
+        auth_info = self._auth_info()
 
         for p in printers:
             card = PrinterCard(p, auth_info, self.scroll_content)
             card.status_changed.connect(self.refresh_cards_status)
             self.scroll_layout.insertWidget(self.scroll_layout.count() - 1, card)
 
+        self._sync_empty_state()
+        self._flush_papercut_pending()
+
     def on_scan_error(self, err_msg):
+        self.smb_scan_done = True
         self.btn_scan.setEnabled(True)
         self.btn_discover.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.status_lbl.setText("Gagal memindai printer.")
+        self._flush_papercut_pending()
         QMessageBox.warning(self, "Pemindaian Gagal", err_msg)
+
+    def on_papercut_result(self, result, host, silent):
+        self.btn_papercut.setEnabled(True)
+        if host != self.papercut_probe_host:
+            return
+        if result.get("web_url"):
+            self.papercut_web_url = result["web_url"]
+            self.btn_papercut_web.setEnabled(True)
+            self.btn_papercut_web.setToolTip(f"Buka halaman akun PaperCut: {result['web_url']}")
+        if not self.smb_scan_done:
+            self.papercut_pending = (result, host, silent)
+            return
+        self.render_papercut(result, host, silent)
+
+    def apply_papercut_share_fallback(self, host, disk_shares):
+        names = {d.lower() for d in disk_shares}
+        if PAPERCUT_CLIENT_SHARE not in names or self.papercut_web_url:
+            return
+        url = f"http://{host}:9191/user"
+        self.papercut_web_url = url
+        self.btn_papercut_web.setEnabled(True)
+        self.btn_papercut_web.setToolTip(
+            f"Host membagikan PCClient (PaperCut NG/MF). Buka: {url}"
+        )
+        self.status_lbl.setText(
+            f"PaperCut NG/MF terdeteksi di {host} (share PCClient). Klik 'Akun PaperCut' untuk cek kuota."
+        )
+
+    def _flush_papercut_pending(self):
+        if self.papercut_pending is None:
+            return
+        result, host, silent = self.papercut_pending
+        self.papercut_pending = None
+        self.render_papercut(result, host, silent)
+
+    def render_papercut(self, result, host, silent):
+        self.clear_papercut_cards()
+        printers = result.get("printers") or []
+        auth_info = self._auth_info()
+        for p in printers:
+            card = PrinterCard({
+                "kind": "papercut",
+                "name": p["name"],
+                "host": host,
+                "port": result["ipp_port"],
+                "scheme": result["ipp_scheme"],
+            }, auth_info, self.scroll_content)
+            card.status_changed.connect(self.refresh_cards_status)
+            self.scroll_layout.insertWidget(self.scroll_layout.count() - 1, card)
+        if printers:
+            self.status_lbl.setText(f"PaperCut: {len(printers)} antrean ditemukan di {host}.")
+            self.rescan_btn.setVisible(True)
+        elif result.get("web_url") and not silent:
+            self.status_lbl.setText(
+                f"PaperCut NG/MF terdeteksi di {host}. Klik 'Akun PaperCut' untuk cek kuota; "
+                "pakai 'Cari Printer' untuk antrean SMB."
+            )
+        elif not silent:
+            QMessageBox.information(
+                self, "PaperCut",
+                f"Tidak ada layanan PaperCut di {host}.\n"
+                "Port dicek: 9163/9164 (Mobility Print), 9191/9192 (NG/MF).",
+            )
+        self._sync_empty_state()
+        self.progress_bar.setVisible(False)
+
+    def clear_papercut_cards(self):
+        for i in range(self.scroll_layout.count() - 1, -1, -1):
+            widget = self.scroll_layout.itemAt(i).widget()
+            if isinstance(widget, PrinterCard) and widget.kind == "papercut":
+                self.scroll_layout.takeAt(i)
+                widget.deleteLater()
+        self._sync_empty_state()
+
+    def _sync_empty_state(self):
+        has_cards = any(
+            isinstance(self.scroll_layout.itemAt(i).widget(), PrinterCard)
+            for i in range(self.scroll_layout.count())
+        )
+        self.empty_state.setVisible(not has_cards)
+
+    def open_papercut_account(self):
+        if self.papercut_web_url:
+            QDesktopServices.openUrl(QUrl(self.papercut_web_url))
 
     def refresh_cards_status(self):
         for i in range(self.scroll_layout.count() - 1):
